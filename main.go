@@ -9,21 +9,38 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/umahmood/haversine"
 )
+
+var brightGreen = lipgloss.NewStyle().Foreground(lipgloss.Color("#00ff00"))
+var mediumGreen = lipgloss.NewStyle().Foreground(lipgloss.Color("#009900"))
+var dimGreen = lipgloss.NewStyle().Foreground(lipgloss.Color("#003300"))
 
 var brightGreenBg = lipgloss.NewStyle().Background(lipgloss.Color("#00ff00"))
 var mediumGreenBg = lipgloss.NewStyle().Background(lipgloss.Color("#009900"))
 var dimGreenBg = lipgloss.NewStyle().Background(lipgloss.Color("#003300"))
-var emptyBg = lipgloss.NewStyle().Background(lipgloss.Color("#001100"))
+var emptyBg = lipgloss.NewStyle().Background(lipgloss.Color("#1b1c1c"))
 var frameBg = lipgloss.NewStyle().Background(lipgloss.Color("#3b3a3a"))
+
+type plane struct {
+	lat                  float64
+	lon                  float64
+	bearingFromObserver  float64
+	distanceFromObserver float64
+}
 
 type model struct {
 	width       int
 	height      int
+	maxR        float64
+	aspectRatio float64
 	sweepAngle  float64
 	northOffset float64
 	radarRange  int
 	buffer      [][]cell
+	planes      []plane
+	lat         float64
+	lon         float64
 }
 
 type cell struct {
@@ -66,6 +83,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+
+		maxRx := float64(m.width / 4)
+		maxRy := float64(m.height) / (2.0 * m.aspectRatio)
+		m.maxR = min(maxRx, maxRy)
 		m.buffer = make([][]cell, m.height)
 		for y := range m.buffer {
 			m.buffer[y] = make([]cell, m.width)
@@ -84,12 +105,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for y := range m.buffer {
 			for x := range m.buffer[y] {
 				c := &m.buffer[y][x]
-				if c.sweepAge < 20 {
+				if c.sweepAge < 100 {
 					c.sweepAge = c.sweepAge + 1
 				}
 
 			}
 		}
+
+		m.planes = make([]plane, 1)
+		m.planes[0] = plane{0, 0.5, 0, 0}
+		m.SetPlaneLocationDetails(&m.planes[0])
 
 		return m, doTick()
 	}
@@ -120,17 +145,40 @@ func getOutlineChar(theta float64) rune {
 
 }
 
+func (m model) SetPlaneLocationDetails(p *plane) {
+	curr_location := haversine.Coord{Lat: m.lat, Lon: m.lon}
+	planeLocation := haversine.Coord{Lat: p.lat, Lon: p.lon}
+
+	mi, _ := haversine.Distance(curr_location, planeLocation)
+	nm := mi / 1.15078
+	scale := float64(m.maxR-4) / float64(m.radarRange)
+	virtualDistance := nm * scale
+	p.distanceFromObserver = virtualDistance
+
+	dLon := p.lon - m.lon
+	y := math.Sin(dLon) * math.Cos(p.lat)
+	x := math.Cos(m.lat)*math.Sin(p.lat) - math.Sin(m.lat)*math.Cos(p.lat)*math.Cos(dLon)
+	bearing := math.Atan2(y, x)
+	if bearing < 0 {
+		bearing += 2 * math.Pi
+	}
+
+}
+
+func withinSweep(bearing, sweepAngle, width float64) bool {
+	dTheta := bearing - sweepAngle
+
+	return dTheta <= 0.5
+
+}
+
 func (m model) View() string {
 	if m.width == 0 {
 		return "Loading..."
 	}
-	aspectRatio := 0.5
 
-	maxRx := float64(m.width / 4)
-	maxRy := float64(m.height) / (2.0 * aspectRatio)
-	MaxR := min(maxRx, maxRy)
-	r := MaxR - 4
-	cx := int(maxRx)
+	r := m.maxR - 4
+	cx := int(m.maxR)
 	cy := (m.height + 2) / 2
 
 	charsPerNM := float64(r) / float64(m.radarRange)
@@ -158,7 +206,7 @@ func (m model) View() string {
 	for d := labelStepNM; d < float64(m.radarRange); d += labelStepNM {
 		radius := d * charsPerNM
 		x := cx + int(radius*math.Sin(0))
-		y := cy - int(radius*math.Cos(0)*aspectRatio)
+		y := cy - int(radius*math.Cos(0)*m.aspectRatio)
 
 		label := strconv.Itoa(int(d))
 		for i, r := range []rune(label) {
@@ -170,13 +218,30 @@ func (m model) View() string {
 		}
 	}
 
+	for _, p := range m.planes {
+		if withinSweep(p.bearingFromObserver, m.sweepAngle, 0.8) {
+			posX := cx + int(p.distanceFromObserver*math.Cos(p.bearingFromObserver+float64(m.northOffset)))
+			posY := cy + int(p.distanceFromObserver*math.Sin(p.bearingFromObserver+float64(m.northOffset))*m.aspectRatio)
+
+			if inBounds(m.width, m.height, posX, posY) {
+				c := &m.buffer[posY][posX]
+				c.kind = "plane"
+				c.char = '^'
+
+			} else {
+				log.Printf("ffkln")
+			}
+		}
+
+	}
+
 	// Sweep Arm
 	prevAngle := m.sweepAngle - 0.1
 	for l := 0; l <= int(r); l++ {
 		for interp := 0.0; interp <= 1.0; interp += 0.2 {
 			theta := prevAngle + interp*(m.sweepAngle-prevAngle)
 			x := cx + int(float64(l)*math.Cos(theta))
-			y := cy + int(float64(l)*math.Sin(theta)*aspectRatio)
+			y := cy + int(float64(l)*math.Sin(theta)*m.aspectRatio)
 
 			if inBounds(m.width, m.height, x, y) {
 				c := &m.buffer[y][x]
@@ -191,7 +256,7 @@ func (m model) View() string {
 
 	for theta := 0.0; theta < 2*math.Pi; theta += 0.001 {
 		x := cx + int(r*math.Cos(theta))
-		y := cy + int(r*math.Sin(theta)*aspectRatio)
+		y := cy + int(r*math.Sin(theta)*m.aspectRatio)
 		if inBounds(m.width, m.height, x, y) {
 			c := &m.buffer[y][x]
 			c.char = getOutlineChar(theta)
@@ -212,7 +277,7 @@ func (m model) View() string {
 		theta := tick * math.Pi / 180
 
 		x := cx + int((r+3)*math.Cos(theta+float64(m.northOffset)))
-		y := cy + int((r+3)*math.Sin(theta+float64(m.northOffset))*aspectRatio)
+		y := cy + int((r+3)*math.Sin(theta+float64(m.northOffset))*m.aspectRatio)
 		for j, r := range tickLabels[i] {
 			if inBounds(m.width, m.height, x+j, y) {
 				c := &m.buffer[y][x+j]
@@ -233,6 +298,23 @@ func (m model) View() string {
 				b.WriteString(frameBg.Render(" "))
 				continue
 
+			}
+
+			if c.kind == "plane" {
+				switch {
+				case c.sweepAge <= 10:
+					b.WriteString(brightGreen.Render(string(c.char)))
+
+				case c.sweepAge > 10 && c.sweepAge <= 25:
+					b.WriteString(mediumGreen.Render(string(c.char)))
+
+				case c.sweepAge > 25 && c.sweepAge <= 50:
+					b.WriteString(dimGreen.Render(string(c.char)))
+
+				default:
+					b.WriteString(string(c.char))
+				}
+				continue
 			}
 
 			switch {
@@ -266,7 +348,10 @@ func main() {
 	defer f.Close()
 
 	p := tea.NewProgram(model{
-		radarRange: 75,
+		radarRange:  75,
+		aspectRatio: 0.5,
+		lat:         0,
+		lon:         0,
 	}, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		log.Fatal(err)
