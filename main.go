@@ -23,6 +23,7 @@ var emptyBg = lipgloss.NewStyle().Background(lipgloss.Color("#1b1c1c"))
 var frameBg = lipgloss.NewStyle().Background(lipgloss.Color("#3b3a3a"))
 
 type plane struct {
+	hex                  string
 	lat                  float64
 	lon                  float64
 	bearingFromObserver  float64
@@ -80,11 +81,11 @@ func (m model) Init() tea.Cmd {
 
 func (m model) GetPlanes() []plane {
 	planes := []plane{
-		{lat: 41.0, lon: -73.0}, // northeast ~40NM
-		{lat: 40.3, lon: -74.5}, // southwest ~40NM
-		{lat: 40.7, lon: -73.3}, // east ~40NM
-		{lat: 41.2, lon: -74.0}, // north ~40NM
-		{lat: 40.2, lon: -73.8}, // southeast ~40NM
+		{lat: 41.0, lon: -73.0, hex: "AAA123"}, // northeast ~40NM
+		{lat: 40.3, lon: -74.5, hex: "BBB123"}, // southwest ~40NM
+		{lat: 40.7, lon: -73.3, hex: "CCC123"}, // east ~40NM
+		{lat: 41.2, lon: -74.0, hex: "DDD123"}, // north ~40NM
+		{lat: 40.2, lon: -73.8, hex: "EEE123"}, // southeast ~40NM
 	}
 
 	for i, _ := range planes {
@@ -186,7 +187,12 @@ func (m model) View() string {
 	if m.width == 0 {
 		return "Loading..."
 	}
+	radar := m.renderRadar()
+	return radar
 
+}
+
+func (m model) renderRadar() string {
 	r := m.maxR - 4
 	cx := int(m.maxR)
 	cy := (m.height + 2) / 2
