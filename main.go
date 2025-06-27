@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/umahmood/haversine"
@@ -49,9 +50,12 @@ type model struct {
 	visiblePlanes       map[string]bool
 	lat                 float64
 	lon                 float64
-
-	tbl         table.Model
-	tableLoaded bool
+	showModal           bool
+	tbl                 table.Model
+	tableLoaded         bool
+	latInput            textinput.Model
+	lonInput            textinput.Model
+	modalFocused        bool
 }
 
 type cell struct {
@@ -147,37 +151,106 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	var cmds []tea.Cmd
 
+	// Always update table
 	m.tbl, cmd = m.tbl.Update(msg)
 	cmds = append(cmds, cmd)
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// Handle text input updates when modal is focused
+		if m.showModal && m.modalFocused {
+			switch msg.String() {
+			case "tab":
+				// Switch focus between inputs
+				if m.latInput.Focused() {
+					m.latInput.Blur()
+					m.lonInput.Focus()
+				} else {
+					m.lonInput.Blur()
+					m.latInput.Focus()
+				}
+				return m, tea.Batch(cmds...)
+			case "enter":
+				// Apply the new coordinates
+				if latStr := m.latInput.Value(); latStr != "" {
+					if lat, err := strconv.ParseFloat(latStr, 64); err == nil {
+						m.lat = lat
+					}
+				}
+				if lonStr := m.lonInput.Value(); lonStr != "" {
+					if lon, err := strconv.ParseFloat(lonStr, 64); err == nil {
+						m.lon = lon
+					}
+				}
+				m.showModal = false
+				m.modalFocused = false
+				m.latInput.Blur()
+				m.lonInput.Blur()
+				return m, tea.Batch(cmds...)
+			case "esc":
+				// Cancel and close modal
+				m.showModal = false
+				m.modalFocused = false
+				m.latInput.Blur()
+				m.lonInput.Blur()
+				// Reset inputs to current values
+				m.latInput.SetValue(fmt.Sprintf("%.4f", m.lat))
+				m.lonInput.SetValue(fmt.Sprintf("%.4f", m.lon))
+				return m, tea.Batch(cmds...)
+			}
+
+			// Update the focused input
+			if m.latInput.Focused() {
+				m.latInput, cmd = m.latInput.Update(msg)
+				cmds = append(cmds, cmd)
+			} else if m.lonInput.Focused() {
+				m.lonInput, cmd = m.lonInput.Update(msg)
+				cmds = append(cmds, cmd)
+			}
+
+			return m, tea.Batch(cmds...)
+		}
+
+		// Handle regular key messages when modal is not focused
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Quit
 
-		case "=":
+		case "]":
 			m.northOffset += 0.1
-			return m, nil
-
-		case "-":
-			m.northOffset -= 0.1
-			return m, nil
+			return m, tea.Batch(cmds...)
 
 		case "[":
+			m.northOffset -= 0.1
+			return m, tea.Batch(cmds...)
+
+		case "=":
 			if m.radarRange < 200 {
 				m.radarRange += 10
 			}
+			return m, tea.Batch(cmds...)
 
-			return m, nil
-		case "]":
+		case "-":
 			if m.radarRange > 20 {
 				m.radarRange -= 10
 			}
+			return m, tea.Batch(cmds...)
 
-			return m, nil
+		case "m":
+			m.showModal = !m.showModal
+			if m.showModal {
+				m.modalFocused = true
+				m.latInput.Focus()
+				m.latInput.SetValue(fmt.Sprintf("%.4f", m.lat))
+				m.lonInput.SetValue(fmt.Sprintf("%.4f", m.lon))
+			} else {
+				m.modalFocused = false
+				m.latInput.Blur()
+				m.lonInput.Blur()
+			}
+			return m, tea.Batch(cmds...)
 		}
-		return m, nil
+		return m, tea.Batch(cmds...)
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -193,10 +266,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if !m.tableLoaded {
 			columns := []table.Column{
-				{Title: "ID", Width: 8},
-				{Title: "LAT", Width: 10},
-				{Title: "LON", Width: 10},
-				{Title: "DIST", Width: 8},
+				{Title: "ID", Width: 6},
+				{Title: "LAT", Width: 8},
+				{Title: "LON", Width: 8},
+				{Title: "DIST(NM)", Width: 8},
 			}
 			rows := []table.Row{}
 			m.tbl = table.New(
@@ -214,8 +287,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				BorderBottom(true).
 				Bold(false)
 			s.Selected = s.Selected.
-				Foreground(lipgloss.Color("229")).
-				Background(lipgloss.Color("57")).
+				Foreground(lipgloss.Color("black")).
+				Background(mediumGreen).
 				Bold(false)
 			m.tbl.SetStyles(s)
 
@@ -225,7 +298,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.planes = m.GetPlanes()
 			m.initialPlanesLoaded = true
 		}
-		return m, nil
+		return m, tea.Batch(cmds...)
 
 	case tickMsg:
 		m.sweepAngle += 0.1
@@ -240,23 +313,38 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if c.sweepAge < 100 {
 					c.sweepAge = c.sweepAge + 1
 				}
-
 			}
 		}
 		currentVisible := make(map[string]bool)
+		currentInSweep := make(map[string]bool)
 		for _, p := range m.planes {
-			if withinSweep(p.bearingFromObserver, m.sweepAngle, 0.5, m.northOffset) &&
-				p.distanceFromObserver <= float64(m.radarRange) {
-
+			// Track all planes within range, regardless of sweep position
+			if p.distanceFromObserver <= float64(m.radarRange) {
 				currentVisible[p.hex] = true
-				if !m.visiblePlanes[p.hex] {
-					m.UpdatePlaneRow(p)
 
-					cmds = append(cmds, tea.Printf(""))
+				// Track planes currently in sweep
+				if withinSweep(p.bearingFromObserver, m.sweepAngle, 0.5, m.northOffset) {
+					currentInSweep[p.hex] = true
+					if !m.visiblePlanes[p.hex] {
+						m.UpdatePlaneRow(p)
+						cmds = append(cmds, tea.Printf(""))
+					}
 				}
 			}
 		}
-		m.visiblePlanes = currentVisible
+
+		// Remove planes from table that are no longer visible
+		rows := m.tbl.Rows()
+		var newRows []table.Row
+		for _, row := range rows {
+			planeID := row[0]
+			if currentVisible[planeID] {
+				newRows = append(newRows, row)
+			}
+		}
+		m.tbl.SetRows(newRows)
+
+		m.visiblePlanes = currentInSweep
 		cmds = append(cmds, doTick())
 
 		return m, tea.Batch(cmds...)
@@ -293,7 +381,17 @@ func (m *model) View() string {
 	if m.width == 0 {
 		return "Loading..."
 	}
-	log.Printf("table contents:\n%s", m.tbl.View())
+
+	bearingDegrees := m.northOffset * 180 / math.Pi
+	if bearingDegrees < 0 {
+		bearingDegrees += 360
+	}
+
+	statusBar := lipgloss.NewStyle().
+		Background(lipgloss.Color("235")).
+		Height(1).
+		Width(m.width).
+		Render(fmt.Sprintf("Range: %d NM  -\\= |  Bearing: %.0f° [\\] |  lat: %f  |  lon: %f", m.radarRange, bearingDegrees, m.lat, m.lon))
 
 	radar := m.renderRadar(m.width/2, m.height)
 	tableStr := lipgloss.NewStyle().
@@ -302,11 +400,54 @@ func (m *model) View() string {
 		AlignVertical(lipgloss.Center).
 		AlignHorizontal(lipgloss.Center).
 		Render(baseStyle.Render(m.tbl.View()))
-	return lipgloss.JoinHorizontal(
-		lipgloss.Top,
-		radar,
-		tableStr,
+
+	main := lipgloss.JoinVertical(
+		lipgloss.Left,
+
+		lipgloss.JoinHorizontal(
+			lipgloss.Top,
+			radar,
+			tableStr,
+		),
+		statusBar,
 	)
+
+	if m.showModal {
+		// Create modal content with text inputs
+		modalContent := lipgloss.JoinVertical(
+			lipgloss.Left,
+			lipgloss.NewStyle().Bold(true).Render("Set Observer Location"),
+			"",
+			"Latitude:",
+			m.latInput.View(),
+			"",
+			"Longitude:",
+			m.lonInput.View(),
+			"",
+			lipgloss.NewStyle().Faint(true).Render("Tab: Switch | Enter: Apply | Esc: Cancel"),
+		)
+
+		// Overlay modal on top of main UI
+		overlayModal := lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder()).
+			Padding(1, 2).
+			Background(lipgloss.Color("#222")).
+			Foreground(lipgloss.Color("#fff")).
+			Align(lipgloss.Center, lipgloss.Center).
+			Width(50).
+			Height(12).
+			Render(modalContent)
+
+		return lipgloss.Place(
+			m.width,
+			m.height,
+			lipgloss.Center,
+			lipgloss.Center,
+			overlayModal,
+		)
+	}
+
+	return main
 
 }
 
@@ -387,9 +528,11 @@ func (m model) renderRadar(width, height int) string {
 
 	for i, p := range m.planes {
 		if withinSweep(p.bearingFromObserver, m.sweepAngle, 0.5, m.northOffset) {
-			clampedDistance := min(p.distanceFromObserver, float64(m.radarRange))
+			if p.distanceFromObserver > float64(m.radarRange) {
+				continue
+			}
 			scale := float64(maxR-4) / float64(m.radarRange)
-			virtualDistance := clampedDistance * scale
+			virtualDistance := p.distanceFromObserver * scale
 
 			displayBearing := p.bearingFromObserver + m.northOffset
 			posX := cx + int(virtualDistance*math.Sin(displayBearing))
@@ -438,7 +581,7 @@ func (m model) renderRadar(width, height int) string {
 	}
 	for i, tick := range tickMarks {
 		phi := tick * math.Pi / 180
-		phi += m.northOffset
+		phi -= m.northOffset
 
 		x := cx + int((r+3)*math.Sin(phi))
 		y := cy - int((r+3)*math.Cos(phi)*m.aspectRatio)
@@ -489,6 +632,9 @@ func (m model) renderRadar(width, height int) string {
 				case c.sweepAge == 99:
 					c.kind = "blank"
 					c.char = ' '
+
+				default:
+					style = style.Background(dimGreen)
 				}
 				b.WriteString(style.Render(string(c.char)))
 				continue
@@ -504,6 +650,32 @@ func (m model) renderRadar(width, height int) string {
 	return b.String()
 }
 
+func newModel() *model {
+	latInput := textinput.New()
+	latInput.Placeholder = "40.7128"
+	latInput.CharLimit = 10
+	latInput.Width = 15
+
+	lonInput := textinput.New()
+	lonInput.Placeholder = "-74.0060"
+	lonInput.CharLimit = 11
+	lonInput.Width = 15
+
+	return &model{
+		radarRange:          70,
+		aspectRatio:         0.5,
+		lat:                 40.7128,
+		lon:                 -74.0060,
+		initialPlanesLoaded: false,
+		tableLoaded:         false,
+		visiblePlanes:       make(map[string]bool),
+		showModal:           false,
+		latInput:            latInput,
+		lonInput:            lonInput,
+		modalFocused:        false,
+	}
+}
+
 func main() {
 	f, err := tea.LogToFile("debug.log", "debug")
 	if err != nil {
@@ -512,17 +684,8 @@ func main() {
 
 	defer f.Close()
 
-	p := tea.NewProgram(&model{
-		radarRange:          150,
-		aspectRatio:         0.5,
-		lat:                 40.7128,
-		lon:                 -74.0060,
-		initialPlanesLoaded: false,
-		tableLoaded:         false,
-		visiblePlanes:       make(map[string]bool),
-	}, tea.WithAltScreen())
+	p := tea.NewProgram(newModel(), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		log.Fatal(err)
 	}
-
 }
