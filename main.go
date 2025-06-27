@@ -8,7 +8,14 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
+
+var brightGreenBg = lipgloss.NewStyle().Background(lipgloss.Color("#00ff00"))
+var mediumGreenBg = lipgloss.NewStyle().Background(lipgloss.Color("#009900"))
+var dimGreenBg = lipgloss.NewStyle().Background(lipgloss.Color("#003300"))
+var emptyBg = lipgloss.NewStyle().Background(lipgloss.Color("#001100"))
+var frameBg = lipgloss.NewStyle().Background(lipgloss.Color("#3b3a3a"))
 
 type model struct {
 	width       int
@@ -16,11 +23,13 @@ type model struct {
 	sweepAngle  float64
 	northOffset float64
 	radarRange  int
+	buffer      [][]cell
 }
 
 type cell struct {
-	char rune
-	kind string
+	char     rune
+	kind     string
+	sweepAge int
 }
 
 func (m model) Init() tea.Cmd {
@@ -57,12 +66,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.buffer = make([][]cell, m.height)
+		for y := range m.buffer {
+			m.buffer[y] = make([]cell, m.width)
+			for x := range m.buffer[y] {
+				m.buffer[y][x] = cell{' ', "blank", int(100)}
+			}
+		}
 		return m, nil
 
 	case tickMsg:
 		m.sweepAngle += 0.1
 		if m.sweepAngle >= 2*math.Pi {
 			m.sweepAngle = 0
+		}
+
+		for y := range m.buffer {
+			for x := range m.buffer[y] {
+				c := &m.buffer[y][x]
+				if c.sweepAge < 20 {
+					c.sweepAge = c.sweepAge + 1
+				}
+
+			}
 		}
 
 		return m, doTick()
@@ -119,14 +145,16 @@ func (m model) View() string {
 		labelStepNM = 20
 	}
 
-	buffer := make([][]cell, m.height)
-	for y := range buffer {
-		buffer[y] = make([]cell, m.width)
-		for x := range buffer[y] {
-			buffer[y][x] = cell{' ', "blank"}
+	for y := range m.buffer {
+		for x := range m.buffer[y] {
+			c := &m.buffer[y][x]
+			//r := []rune(strconv.Itoa(c.sweepAge))
+			c.char = ' '
+			c.kind = "blank"
 		}
 	}
 
+	// Distance Labels
 	for d := labelStepNM; d < float64(m.radarRange); d += labelStepNM {
 		radius := d * charsPerNM
 		x := cx + int(radius*math.Sin(0))
@@ -135,17 +163,28 @@ func (m model) View() string {
 		label := strconv.Itoa(int(d))
 		for i, r := range []rune(label) {
 			if inBounds(m.width, m.height, x+i, y) {
-				buffer[y][x+i] = cell{r, "ring"}
+				c := &m.buffer[y][x+i]
+				c.kind = "label"
+				c.char = r
 			}
 		}
 	}
 
+	// Sweep Arm
+	prevAngle := m.sweepAngle - 0.1
 	for l := 0; l <= int(r); l++ {
-		x := cx + int(float64(l)*math.Cos(m.sweepAngle))
-		y := cy + int(float64(l)*math.Sin(m.sweepAngle)*aspectRatio)
+		for interp := 0.0; interp <= 1.0; interp += 0.2 {
+			theta := prevAngle + interp*(m.sweepAngle-prevAngle)
+			x := cx + int(float64(l)*math.Cos(theta))
+			y := cy + int(float64(l)*math.Sin(theta)*aspectRatio)
 
-		if inBounds(m.width, m.height, x, y) {
-			buffer[y][x] = cell{'#', "sweep"}
+			if inBounds(m.width, m.height, x, y) {
+				c := &m.buffer[y][x]
+				c.kind = "sweep"
+				c.sweepAge = 0
+				c.char = ' '
+
+			}
 		}
 
 	}
@@ -154,7 +193,10 @@ func (m model) View() string {
 		x := cx + int(r*math.Cos(theta))
 		y := cy + int(r*math.Sin(theta)*aspectRatio)
 		if inBounds(m.width, m.height, x, y) {
-			buffer[y][x] = cell{getOutlineChar(theta), "ring"}
+			c := &m.buffer[y][x]
+			c.char = getOutlineChar(theta)
+			c.kind = "ring"
+
 		}
 
 	}
@@ -173,7 +215,10 @@ func (m model) View() string {
 		y := cy + int((r+3)*math.Sin(theta+float64(m.northOffset))*aspectRatio)
 		for j, r := range tickLabels[i] {
 			if inBounds(m.width, m.height, x+j, y) {
-				buffer[y][x+j] = cell{r, "ring"}
+				c := &m.buffer[y][x+j]
+				c.char = r
+				c.kind = "label"
+
 			}
 
 		}
@@ -181,10 +226,31 @@ func (m model) View() string {
 	}
 
 	var b strings.Builder
-	for _, row := range buffer {
+	for _, row := range m.buffer {
+
 		for _, c := range row {
-			b.WriteRune(c.char)
+			if c.kind == "ring" {
+				b.WriteString(frameBg.Render(" "))
+				continue
+
+			}
+
+			switch {
+			case c.sweepAge == 0:
+				b.WriteString(brightGreenBg.Render(string(c.char)))
+
+			case c.sweepAge > 0 && c.sweepAge <= 3:
+				b.WriteString(mediumGreenBg.Render(string(c.char)))
+
+			case c.sweepAge > 3 && c.sweepAge <= 12:
+				b.WriteString(dimGreenBg.Render(string(c.char)))
+
+			default:
+				b.WriteString(string(c.char))
+			}
+
 		}
+
 		b.WriteByte('\n')
 	}
 
