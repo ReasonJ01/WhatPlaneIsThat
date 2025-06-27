@@ -1,12 +1,14 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"math"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/umahmood/haversine"
@@ -22,6 +24,10 @@ var dimGreenBg = lipgloss.NewStyle().Background(lipgloss.Color("#003300"))
 var emptyBg = lipgloss.NewStyle().Background(lipgloss.Color("#1b1c1c"))
 var frameBg = lipgloss.NewStyle().Background(lipgloss.Color("#3b3a3a"))
 
+var baseStyle = lipgloss.NewStyle().
+	BorderStyle(lipgloss.NormalBorder()).
+	BorderForeground(lipgloss.Color("240"))
+
 type plane struct {
 	hex                  string
 	lat                  float64
@@ -34,15 +40,18 @@ type model struct {
 	initialPlanesLoaded bool
 	width               int
 	height              int
-	maxR                float64
 	aspectRatio         float64
 	sweepAngle          float64
 	northOffset         float64
 	radarRange          int
 	buffer              [][]cell
 	planes              []plane
+	visiblePlanes       map[string]bool
 	lat                 float64
 	lon                 float64
+
+	tbl         table.Model
+	tableLoaded bool
 }
 
 type cell struct {
@@ -75,11 +84,18 @@ func withinSweep(bearing, sweepAngle, width, northOffset float64) bool {
 	return diff <= width
 }
 
+func isBeyondCircle(cx, cy, r, px, py float64) bool {
+	dx := px - cx
+	dy := py - cy
+	distance := math.Sqrt(dx*dx + dy*dy)
+	return distance > r
+}
+
 func (m model) Init() tea.Cmd {
 	return doTick()
 }
 
-func (m model) GetPlanes() []plane {
+func (m *model) GetPlanes() []plane {
 	planes := []plane{
 		{lat: 41.0, lon: -73.0, hex: "AAA123"}, // northeast ~40NM
 		{lat: 40.3, lon: -74.5, hex: "BBB123"}, // southwest ~40NM
@@ -95,7 +111,45 @@ func (m model) GetPlanes() []plane {
 
 }
 
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *model) UpdatePlaneRow(p plane) tea.Cmd {
+	log.Printf("updating row for %s", p.hex)
+
+	rows := m.tbl.Rows()
+
+	index := -1
+	for i, _ := range rows {
+		if rows[i][0] == p.hex {
+			index = i
+		}
+	}
+
+	newRow := table.Row{
+		p.hex,
+		fmt.Sprintf("%.4f", p.lat),
+		fmt.Sprintf("%.4f", p.lon),
+		fmt.Sprintf("%.4f", p.distanceFromObserver),
+	}
+
+	var newRows []table.Row
+	if index == -1 {
+		newRows = append([]table.Row{newRow}, rows...)
+	} else {
+		newRows = append([]table.Row{newRow}, append(rows[:index], rows[index+1:]...)...)
+	}
+	log.Printf("table rows : %+v", newRows)
+
+	m.tbl.SetRows(newRows)
+
+	return nil
+}
+
+func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+	var cmds []tea.Cmd
+
+	m.tbl, cmd = m.tbl.Update(msg)
+	cmds = append(cmds, cmd)
+
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -110,6 +164,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.northOffset -= 0.1
 			return m, nil
 
+		case "[":
+			if m.radarRange < 200 {
+				m.radarRange += 10
+			}
+
+			return m, nil
+		case "]":
+			if m.radarRange > 20 {
+				m.radarRange -= 10
+			}
+
+			return m, nil
 		}
 		return m, nil
 
@@ -117,17 +183,44 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 
-		maxRx := float64(m.width / 4)
-		maxRy := float64(m.height) / (2.0 * m.aspectRatio)
-		m.maxR = min(maxRx, maxRy)
 		m.buffer = make([][]cell, m.height)
 		for y := range m.buffer {
-			m.buffer[y] = make([]cell, m.width)
+			m.buffer[y] = make([]cell, m.width/2)
 			for x := range m.buffer[y] {
 				m.buffer[y][x] = cell{' ', "blank", int(100)}
 			}
 		}
 
+		if !m.tableLoaded {
+			columns := []table.Column{
+				{Title: "ID", Width: 8},
+				{Title: "LAT", Width: 10},
+				{Title: "LON", Width: 10},
+				{Title: "DIST", Width: 8},
+			}
+			rows := []table.Row{}
+			m.tbl = table.New(
+				table.WithColumns(columns),
+				table.WithRows(rows),
+				table.WithFocused(true),
+				table.WithHeight(7),
+			)
+
+			// Set default styles with basic customization
+			s := table.DefaultStyles()
+			s.Header = s.Header.
+				BorderStyle(lipgloss.NormalBorder()).
+				BorderForeground(lipgloss.Color("240")).
+				BorderBottom(true).
+				Bold(false)
+			s.Selected = s.Selected.
+				Foreground(lipgloss.Color("229")).
+				Background(lipgloss.Color("57")).
+				Bold(false)
+			m.tbl.SetStyles(s)
+
+			m.tableLoaded = true
+		}
 		if !m.initialPlanesLoaded {
 			m.planes = m.GetPlanes()
 			m.initialPlanesLoaded = true
@@ -150,11 +243,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			}
 		}
+		currentVisible := make(map[string]bool)
+		for _, p := range m.planes {
+			if withinSweep(p.bearingFromObserver, m.sweepAngle, 0.5, m.northOffset) &&
+				p.distanceFromObserver <= float64(m.radarRange) {
 
-		return m, doTick()
+				currentVisible[p.hex] = true
+				if !m.visiblePlanes[p.hex] {
+					m.UpdatePlaneRow(p)
+
+					cmds = append(cmds, tea.Printf(""))
+				}
+			}
+		}
+		m.visiblePlanes = currentVisible
+		cmds = append(cmds, doTick())
+
+		return m, tea.Batch(cmds...)
 	}
 
-	return m, nil
+	return m, tea.Batch(cmds...)
 }
 
 func (m model) SetPlaneLocationDetails(p *plane) {
@@ -163,10 +271,8 @@ func (m model) SetPlaneLocationDetails(p *plane) {
 
 	mi, _ := haversine.Distance(curr_location, planeLocation)
 	nm := mi / 1.15078
-	scale := float64(m.maxR-4) / float64(m.radarRange)
-	virtualDistance := min(nm, float64(m.radarRange)) * scale
 
-	p.distanceFromObserver = virtualDistance
+	p.distanceFromObserver = nm
 
 	lat0Rad := m.lat
 	lat1Rad := p.lat
@@ -180,22 +286,38 @@ func (m model) SetPlaneLocationDetails(p *plane) {
 	}
 	p.bearingFromObserver = bearing
 	log.Printf("SetPlane: lat=%.4f, lon=%.4f → bearing=%.4f, dist=%.4f",
-		p.lat, p.lon, bearing, virtualDistance)
+		p.lat, p.lon, bearing, nm)
 }
 
-func (m model) View() string {
+func (m *model) View() string {
 	if m.width == 0 {
 		return "Loading..."
 	}
-	radar := m.renderRadar()
-	return radar
+	log.Printf("table contents:\n%s", m.tbl.View())
+
+	radar := m.renderRadar(m.width/2, m.height)
+	tableStr := lipgloss.NewStyle().
+		Height(m.height).
+		Width(m.width / 2).
+		AlignVertical(lipgloss.Center).
+		AlignHorizontal(lipgloss.Center).
+		Render(baseStyle.Render(m.tbl.View()))
+	return lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		radar,
+		tableStr,
+	)
 
 }
 
-func (m model) renderRadar() string {
-	r := m.maxR - 4
-	cx := int(m.maxR)
-	cy := (m.height + 2) / 2
+func (m model) renderRadar(width, height int) string {
+	maxRx := float64(width/2) - 5
+	maxRy := float64(height)/(2.0*m.aspectRatio) - 5
+	maxR := min(maxRx, maxRy)
+	r := maxR
+
+	cx := width / 2
+	cy := height / 2
 
 	charsPerNM := float64(r) / float64(m.radarRange)
 
@@ -228,7 +350,7 @@ func (m model) renderRadar() string {
 
 		label := strconv.Itoa(int(d))
 		for i, r := range []rune(label) {
-			if inBounds(m.width, m.height, x+i, y) {
+			if inBounds(width, height, x+i, y) {
 				c := &m.buffer[y][x+i]
 				c.kind = "label"
 				c.char = r
@@ -244,7 +366,7 @@ func (m model) renderRadar() string {
 			x := cx + int(float64(l)*math.Sin(theta))
 			y := cy - int(float64(l)*math.Cos(theta)*m.aspectRatio)
 
-			if inBounds(m.width, m.height, x, y) {
+			if inBounds(width, height, x, y) {
 				c := &m.buffer[y][x]
 				c.kind = "sweep"
 				c.sweepAge = 0
@@ -256,7 +378,7 @@ func (m model) renderRadar() string {
 	for phi := 0.0; phi < 2*math.Pi; phi += 0.001 {
 		x := cx + int(r*math.Sin(phi))
 		y := cy - int(r*math.Cos(phi)*m.aspectRatio)
-		if inBounds(m.width, m.height, x, y) {
+		if inBounds(width, height, x, y) {
 			c := &m.buffer[y][x]
 			c.char = ' '
 			c.kind = "ring"
@@ -265,9 +387,13 @@ func (m model) renderRadar() string {
 
 	for i, p := range m.planes {
 		if withinSweep(p.bearingFromObserver, m.sweepAngle, 0.5, m.northOffset) {
+			clampedDistance := min(p.distanceFromObserver, float64(m.radarRange))
+			scale := float64(maxR-4) / float64(m.radarRange)
+			virtualDistance := clampedDistance * scale
+
 			displayBearing := p.bearingFromObserver + m.northOffset
-			posX := cx + int(p.distanceFromObserver*math.Sin(displayBearing)+m.northOffset)
-			posY := cy - int(p.distanceFromObserver*math.Cos(displayBearing)*m.aspectRatio)
+			posX := cx + int(virtualDistance*math.Sin(displayBearing))
+			posY := cy - int(virtualDistance*math.Cos(displayBearing)*m.aspectRatio)
 
 			log.Printf("Plane %d: bearing=%.4f, sweepAngle=%.4f, diff=%.4f, withinSweep=%v",
 				i, p.bearingFromObserver, m.sweepAngle,
@@ -275,14 +401,17 @@ func (m model) renderRadar() string {
 				withinSweep(p.bearingFromObserver, m.sweepAngle, 0.5, m.northOffset))
 			log.Printf("  displayBearing=%.4f, sin=%.4f, cos=%.4f, dist=%.4f, posX=%d, posY=%d",
 				displayBearing, math.Sin(displayBearing), math.Cos(displayBearing),
-				p.distanceFromObserver, posX, posY)
+				virtualDistance, posX, posY)
 
-			log.Printf("  trying to draw at posX=%d posY=%d inBounds=%v", posX, posY, inBounds(m.width, m.height, posX, posY))
+			log.Printf("  trying to draw at posX=%d posY=%d inBounds=%v", posX, posY, inBounds(width, height, posX, posY))
 
-			if inBounds(m.width, m.height, posX, posY) {
+			dx := float64(posX - cx)
+			dy := float64(posY - cy)
+			if inBounds(width, height, posX, posY) && math.Sqrt(dx*dx+dy*dy) < r {
 				c := &m.buffer[posY][posX]
 				c.kind = "plane"
 				c.char = '^'
+
 			}
 		} else {
 			log.Printf("Plane %d NOT in sweep: bearing=%.4f, sweepAngle=%.4f",
@@ -293,7 +422,7 @@ func (m model) renderRadar() string {
 	for phi := 0.0; phi < 2*math.Pi; phi += 0.001 {
 		x := cx + int(r*math.Sin(phi))
 		y := cy - int(r*math.Cos(phi)*m.aspectRatio)
-		if inBounds(m.width, m.height, x, y) {
+		if inBounds(width, height, x, y) {
 			c := &m.buffer[y][x]
 			c.char = ' '
 			c.kind = "ring"
@@ -314,7 +443,7 @@ func (m model) renderRadar() string {
 		x := cx + int((r+3)*math.Sin(phi))
 		y := cy - int((r+3)*math.Cos(phi)*m.aspectRatio)
 		for j, r := range tickLabels[i] {
-			if inBounds(m.width, m.height, x+j, y) {
+			if inBounds(width, height, x+j, y) {
 				c := &m.buffer[y][x+j]
 				c.char = r
 				c.kind = "label"
@@ -383,12 +512,14 @@ func main() {
 
 	defer f.Close()
 
-	p := tea.NewProgram(model{
+	p := tea.NewProgram(&model{
 		radarRange:          150,
 		aspectRatio:         0.5,
 		lat:                 40.7128,
 		lon:                 -74.0060,
 		initialPlanesLoaded: false,
+		tableLoaded:         false,
+		visiblePlanes:       make(map[string]bool),
 	}, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		log.Fatal(err)
