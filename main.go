@@ -31,9 +31,9 @@ var baseStyle = lipgloss.NewStyle().
 	BorderForeground(lipgloss.Color("240"))
 
 const (
-	MIN_RADAR_RANGE      = 20
+	MIN_RADAR_RANGE      = 1
 	MAX_RADAR_RANGE      = 200
-	DEFAULT_RADAR_RANGE  = 70
+	DEFAULT_RADAR_RANGE  = 5
 	DEFAULT_ASPECT_RATIO = 0.5
 	DEFAULT_LAT          = 53.79538
 	DEFAULT_LON          = -1.66134
@@ -49,6 +49,7 @@ type plane struct {
 	FlightCode           string  `json:"flight"`
 	Lat                  float64 `json:"lat"`
 	Lon                  float64 `json:"lon"`
+	Heading              float64 `json:"true_heading"`
 	BearingFromObserver  float64
 	DistanceFromObserver float64
 }
@@ -64,15 +65,16 @@ type model struct {
 	buffer              [][]cell
 	planes              []plane
 	visiblePlanes       map[string]bool
-	lat                 float64
-	lon                 float64
-	showModal           bool
-	tbl                 table.Model
-	tableLoaded         bool
-	latInput            textinput.Model
-	lonInput            textinput.Model
-	modalFocused        bool
-	getLiveFlights      bool
+
+	lat            float64
+	lon            float64
+	showModal      bool
+	tbl            table.Model
+	tableLoaded    bool
+	latInput       textinput.Model
+	lonInput       textinput.Model
+	modalFocused   bool
+	getLiveFlights bool
 }
 
 type cell struct {
@@ -119,6 +121,24 @@ func inBounds(width int, height int, x int, y int) bool {
 		return true
 	}
 	return false
+}
+
+func getPlaneSymbol(p plane) rune {
+	heading := p.Heading
+
+	if heading >= 315 || heading < 45 {
+		return '^'
+	}
+	if heading >= 45 && heading < 135 {
+		return '>'
+	}
+	if heading >= 135 && heading < 225 {
+		return 'v'
+	}
+	if heading >= 225 && heading < 315 {
+		return '<'
+	}
+	return '*'
 }
 
 func withinSweep(bearing, sweepAngle, width, northOffset float64) bool {
@@ -278,13 +298,22 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "=":
 			if m.radarRange < MAX_RADAR_RANGE {
-				m.radarRange += 10
+				if m.radarRange == 1 {
+					m.radarRange = 5
+				} else {
+					m.radarRange += 5
+				}
+
 			}
 			return m, tea.Batch(cmds...)
 
 		case "-":
 			if m.radarRange > MIN_RADAR_RANGE {
-				m.radarRange -= 10
+				if m.radarRange == 5 {
+					m.radarRange = 1
+				} else {
+					m.radarRange -= 5
+				}
 			}
 			return m, tea.Batch(cmds...)
 
@@ -521,14 +550,19 @@ func (m model) renderRadar(width, height int) string {
 
 	charsPerNM := float64(r) / float64(m.radarRange)
 
-	var labelStepNM float64
-	switch {
-	case charsPerNM >= 2:
-		labelStepNM = 10
-	case charsPerNM >= 1:
-		labelStepNM = 20
-	default:
-		labelStepNM = 20
+	// Distance Labels
+	minLabelSpacingPx := 3.0
+	maxLabels := int(float64(r) / (minLabelSpacingPx * charsPerNM))
+	if maxLabels < 1 {
+		maxLabels = 1
+	}
+	niceSteps := []float64{1, 5, 10, 15, 20, 25, 50, 100, 200, 500}
+	labelStepNM := niceSteps[len(niceSteps)-1]
+	for _, step := range niceSteps {
+		if float64(m.radarRange)/step <= float64(maxLabels) {
+			labelStepNM = step
+			break
+		}
 	}
 
 	for y := range m.buffer {
@@ -586,7 +620,7 @@ func (m model) renderRadar(width, height int) string {
 	}
 
 	for _, p := range m.planes {
-		if withinSweep(p.BearingFromObserver, m.sweepAngle, 0.5, m.northOffset) {
+		if _, ok := m.visiblePlanes[p.Hex]; ok {
 			if p.DistanceFromObserver > float64(m.radarRange) {
 				continue
 			}
@@ -604,7 +638,7 @@ func (m model) renderRadar(width, height int) string {
 			if inBounds(width, height, posX, posY) && math.Sqrt(dx*dx+dy*dy) < r {
 				c := &m.buffer[posY][posX]
 				c.kind = "plane"
-				c.char = '^'
+				c.char = getPlaneSymbol(p)
 
 				c.sweepAge = 0
 			}
@@ -722,7 +756,7 @@ func newModel() *model {
 		latInput:            latInput,
 		lonInput:            lonInput,
 		modalFocused:        false,
-		getLiveFlights:      false,
+		getLiveFlights:      true,
 	}
 }
 
