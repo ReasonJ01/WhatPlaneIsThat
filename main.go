@@ -1,27 +1,38 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math"
-	"math/rand"
+	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/ssh"
+	"github.com/charmbracelet/wish"
+	"github.com/charmbracelet/wish/bubbletea"
+	"github.com/charmbracelet/wish/logging"
+	"github.com/muesli/termenv"
 	"github.com/umahmood/haversine"
 )
 
 var brightGreen = lipgloss.Color("#00ff00")
 var mediumGreen = lipgloss.Color("#00bc00")
 var dimGreen = lipgloss.Color("#007900")
+var dimmestGreen = lipgloss.Color("#001b00")
 
 var frameBg = lipgloss.NewStyle().Background(lipgloss.Color("#3b3a3a"))
 var emptyBg = lipgloss.NewStyle().Background(lipgloss.Color("#1b1c1c"))
@@ -33,7 +44,7 @@ var baseStyle = lipgloss.NewStyle().
 const (
 	MIN_RADAR_RANGE      = 1
 	MAX_RADAR_RANGE      = 200
-	DEFAULT_RADAR_RANGE  = 5
+	DEFAULT_RADAR_RANGE  = 15
 	DEFAULT_ASPECT_RATIO = 0.5
 	DEFAULT_LAT          = 53.79538
 	DEFAULT_LON          = -1.66134
@@ -44,6 +55,36 @@ type adsbResponse struct {
 	Planes []plane `json:"ac"`
 }
 
+type flightRouteResponse struct {
+	Response struct {
+		FlightRoute struct {
+			Airline struct {
+				Name string `json:"name"`
+			} `json:"airline"`
+			Origin struct {
+				Name         string `json:"name"`
+				CountryName  string `json:"country_name"`
+				Municipality string `json:"municipality"`
+			} `json:"origin"`
+			Destination struct {
+				Name         string `json:"name"`
+				CountryName  string `json:"country_name"`
+				Municipality string `json:"municipality"`
+			} `json:"destination"`
+		} `json:"flightroute"`
+	} `json:"response"`
+}
+
+type FlightRoute struct {
+	Airline            string
+	OriginAirport      string
+	OriginCountry      string
+	OriginMunicipality string
+	DestAirport        string
+	DestCountry        string
+	DestMunicipality   string
+}
+
 type plane struct {
 	Hex                  string  `json:"hex"`
 	FlightCode           string  `json:"flight"`
@@ -52,6 +93,7 @@ type plane struct {
 	Heading              float64 `json:"true_heading"`
 	BearingFromObserver  float64
 	DistanceFromObserver float64
+	RouteInfo            FlightRoute
 }
 
 type model struct {
@@ -85,6 +127,87 @@ type cell struct {
 
 type tickMsg time.Time
 
+type cachedFlightRoute struct {
+	route    FlightRoute
+	cachedAt time.Time
+}
+
+var routeInfoCache = make(map[string]cachedFlightRoute)
+
+const routeInfoCacheTTL = 10 * time.Minute
+
+func createEmptyFlightRoute() FlightRoute {
+	return FlightRoute{
+		Airline:            "",
+		OriginAirport:      "",
+		OriginCountry:      "",
+		OriginMunicipality: "",
+		DestAirport:        "",
+		DestCountry:        "",
+		DestMunicipality:   "",
+	}
+}
+
+func SetFlightRouteInfo(p *plane) {
+	if _, ok := routeInfoCache[p.FlightCode]; ok {
+		if time.Since(routeInfoCache[p.FlightCode].cachedAt) <= routeInfoCacheTTL {
+			p.RouteInfo = routeInfoCache[p.FlightCode].route
+			return
+		}
+	}
+
+	url := fmt.Sprintf("https://api.adsbdb.com/v0/callsign/%s", strings.TrimSpace(p.FlightCode))
+
+	var flightRouteInfo flightRouteResponse
+
+	res, err := http.Get(url)
+	if err != nil {
+		p.RouteInfo = createEmptyFlightRoute()
+		return
+	}
+
+	bodyBytes, err := io.ReadAll(res.Body)
+	if err != nil {
+		p.RouteInfo = createEmptyFlightRoute()
+		return
+	}
+
+	log.Printf("Flight route API response for %s: %s", p.FlightCode, string(bodyBytes))
+
+	// Handle unknown callsign response
+	if strings.Contains(string(bodyBytes), "\"response\":\"unknown callsign\"") {
+		p.RouteInfo = createEmptyFlightRoute()
+		routeInfoCache[p.FlightCode] = cachedFlightRoute{
+			route:    p.RouteInfo,
+			cachedAt: time.Now(),
+		}
+		return
+	}
+
+	if err := json.Unmarshal(bodyBytes, &flightRouteInfo); err != nil {
+		p.RouteInfo = createEmptyFlightRoute()
+		return
+	}
+
+	fr := flightRouteInfo.Response.FlightRoute
+
+	flightRoute := FlightRoute{
+		Airline:            fr.Airline.Name,
+		OriginAirport:      fr.Origin.Name,
+		OriginCountry:      fr.Origin.CountryName,
+		OriginMunicipality: fr.Origin.Municipality,
+		DestAirport:        fr.Destination.Name,
+		DestCountry:        fr.Destination.CountryName,
+		DestMunicipality:   fr.Destination.Municipality,
+	}
+
+	p.RouteInfo = flightRoute
+	routeInfoCache[p.FlightCode] = cachedFlightRoute{
+		route:    flightRoute,
+		cachedAt: time.Now(),
+	}
+}
+
 func GetLocalFlights(lat float64, lon float64, radius float64) []plane {
 	url := fmt.Sprintf("https://api.adsb.lol/v2/point/%.4f/%.4f/%f", lat, lon, radius)
 
@@ -107,6 +230,10 @@ func GetLocalFlights(lat float64, lon float64, radius float64) []plane {
 
 	log.Printf("adsbResponse: %+v", adsbResponse.Planes)
 
+	for i := range adsbResponse.Planes {
+		SetFlightRouteInfo(&adsbResponse.Planes[i])
+	}
+
 	return adsbResponse.Planes
 }
 
@@ -117,7 +244,7 @@ func doTick() tea.Cmd {
 }
 
 func inBounds(width int, height int, x int, y int) bool {
-	if x > 0 && x < width && y > 0 && y < height {
+	if x >= 0 && x < width && y >= 0 && y < height {
 		return true
 	}
 	return false
@@ -154,10 +281,6 @@ func (m model) Init() tea.Cmd {
 	return doTick()
 }
 
-func randJitter() float64 {
-	return (rand.Float64())
-}
-
 func (m *model) GetPlanes() []plane {
 	if m.getLiveFlights {
 
@@ -168,13 +291,9 @@ func (m *model) GetPlanes() []plane {
 		return planes
 	}
 
-	rand.Seed(time.Now().UnixNano())
 	baseLat := m.lat
 	baseLon := m.lon
 
-	// Calculate positions for planes 30nm north and 30nm east
-	// 30nm north: approximately 0.5 degrees latitude north
-	// 30nm east: approximately 0.5 degrees longitude east (at this latitude)
 	planes := []plane{
 		{Lat: baseLat + 0.5, Lon: baseLon, Hex: "NORTH001", FlightCode: "NORTH30"},
 		{Lat: baseLat, Lon: baseLon + 0.5, Hex: "EAST001", FlightCode: "EAST30"},
@@ -187,23 +306,21 @@ func (m *model) GetPlanes() []plane {
 }
 
 func (m *model) UpdatePlaneRow(p plane) tea.Cmd {
-	log.Printf("updating row for %s", p.Hex)
-
 	rows := m.tbl.Rows()
 
 	index := -1
 	for i := range rows {
-		if rows[i][0] == p.Hex {
+		if rows[i][0] == p.FlightCode {
 			index = i
 		}
 	}
 
 	newRow := table.Row{
-		p.Hex,
 		p.FlightCode,
-		fmt.Sprintf("%.4f", p.Lat),
-		fmt.Sprintf("%.4f", p.Lon),
-		fmt.Sprintf("%.4f", p.DistanceFromObserver),
+		p.RouteInfo.Airline,
+		p.RouteInfo.OriginMunicipality,
+		p.RouteInfo.DestMunicipality,
+		fmt.Sprintf("%.2f", p.DistanceFromObserver),
 	}
 
 	var newRows []table.Row
@@ -212,7 +329,6 @@ func (m *model) UpdatePlaneRow(p plane) tea.Cmd {
 	} else {
 		newRows = append([]table.Row{newRow}, append(rows[:index], rows[index+1:]...)...)
 	}
-	log.Printf("table rows : %+v", newRows)
 
 	m.tbl.SetRows(newRows)
 
@@ -347,24 +463,31 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if !m.tableLoaded {
 			columns := []table.Column{
-				{Title: "ID", Width: 6},
 				{Title: "FLT", Width: 8},
-				{Title: "LAT", Width: 8},
-				{Title: "LON", Width: 8},
-				{Title: "DIST(NM)", Width: 8},
+				{Title: "AIRLINE", Width: 16},
+				{Title: "ORIGIN", Width: 18},
+				{Title: "DEST", Width: 18},
+				{Title: "DIST(NM)", Width: 10},
 			}
 			rows := []table.Row{}
 
-			tableHeight := m.height/2 - 2
+			tableHeight := m.height / 2
 			if tableHeight < 5 {
 				tableHeight = 5
 			}
+
+			tableWidth := 0
+			for _, column := range columns {
+				tableWidth += column.Width
+			}
+			tableWidth += 10
 
 			m.tbl = table.New(
 				table.WithColumns(columns),
 				table.WithRows(rows),
 				table.WithFocused(true),
 				table.WithHeight(tableHeight),
+				table.WithWidth(tableWidth),
 			)
 
 			// Set default styles with basic customization
@@ -408,12 +531,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for _, p := range m.planes {
 			// Track all planes within range, regardless of sweep position
 			if p.DistanceFromObserver <= float64(m.radarRange) {
-				currentVisible[p.Hex] = true
+				currentVisible[p.FlightCode] = true
 
 				// Track planes currently in sweep
 				if withinSweep(p.BearingFromObserver, m.sweepAngle, 0.5, m.northOffset) {
-					currentInSweep[p.Hex] = true
-					if !m.visiblePlanes[p.Hex] {
+					currentInSweep[p.FlightCode] = true
+					if !m.visiblePlanes[p.FlightCode] {
 						m.UpdatePlaneRow(p)
 						cmds = append(cmds, tea.Printf(""))
 					}
@@ -425,8 +548,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		rows := m.tbl.Rows()
 		var newRows []table.Row
 		for _, row := range rows {
-			planeID := row[0]
-			if currentVisible[planeID] {
+			flightCode := row[0]
+			if currentVisible[flightCode] {
 				newRows = append(newRows, row)
 			}
 		}
@@ -540,6 +663,10 @@ func (m *model) View() string {
 }
 
 func (m model) renderRadar(width, height int) string {
+	if width < 5 || height < 5 || len(m.buffer) < 5 || len(m.buffer[0]) < 5 {
+		return "Too small"
+	}
+
 	maxRx := float64(width/2) - 5
 	maxRy := float64(height)/(2.0*m.aspectRatio) - 5
 	maxR := min(maxRx, maxRy)
@@ -620,7 +747,7 @@ func (m model) renderRadar(width, height int) string {
 	}
 
 	for _, p := range m.planes {
-		if _, ok := m.visiblePlanes[p.Hex]; ok {
+		if _, ok := m.visiblePlanes[p.FlightCode]; ok {
 			if p.DistanceFromObserver > float64(m.radarRange) {
 				continue
 			}
@@ -712,6 +839,9 @@ func (m model) renderRadar(width, height int) string {
 				case c.sweepAge > 30 && c.sweepAge <= 60:
 					style = style.Foreground(dimGreen)
 
+				case c.sweepAge > 60 && c.sweepAge <= 90:
+					style = style.Foreground(dimmestGreen)
+
 				case c.sweepAge == 99:
 					c.kind = "blank"
 					c.char = ' '
@@ -760,16 +890,58 @@ func newModel() *model {
 	}
 }
 
+const (
+	host = "100.113.72.80"
+	port = "23234"
+)
+
 func main() {
-	f, err := tea.LogToFile("debug.log", "debug")
+
+	s, err := wish.NewServer(
+		wish.WithAddress(net.JoinHostPort(host, port)),
+		wish.WithHostKeyPath(".ssh/termui_ed25519"),
+		wish.WithMiddleware(
+			radarBubbleteaMiddleware(),
+			logging.Middleware(),
+		),
+	)
 	if err != nil {
-		log.Fatalf("err: %w", err)
+		log.Printf("Could not start server", "error", err)
 	}
 
-	defer f.Close()
+	done := make(chan os.Signal, 1)
+	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+	log.Printf("Starting SSH server", "host", host, "port", port)
+	go func() {
+		if err = s.ListenAndServe(); err != nil && !errors.Is(err, ssh.ErrServerClosed) {
+			log.Printf("Could not start server", "error", err)
+			done <- nil
+		}
+	}()
 
-	p := tea.NewProgram(newModel(), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
-		log.Fatal(err)
+	<-done
+	log.Println("Stopping SSH server")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer func() { cancel() }()
+	if err := s.Shutdown(ctx); err != nil && !errors.Is(err, ssh.ErrServerClosed) {
+		log.Printf("Could not stop server", "error", err)
 	}
+}
+
+func radarBubbleteaMiddleware() wish.Middleware {
+	teaHandler := func(s ssh.Session) *tea.Program {
+		log.Printf("New SSH session started")
+
+		pty, _, active := s.Pty()
+		if !active {
+			log.Printf("no active terminal, skipping")
+			return nil
+		}
+		m := newModel()
+		m.width = pty.Window.Width
+		m.height = pty.Window.Height
+
+		return tea.NewProgram(m, append(bubbletea.MakeOptions(s), tea.WithAltScreen())...)
+	}
+	return bubbletea.MiddlewareWithProgramHandler(teaHandler, termenv.ANSI256)
 }
