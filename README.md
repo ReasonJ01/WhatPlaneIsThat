@@ -6,8 +6,7 @@ I've recently found myself [with the window open a lot](https://www.metoffice.go
 
 ## What is it?
 
-  ![Made with VHS](https://vhs.charm.sh/vhs-45dBio8tVllrXTaq3tRJWi.gif)
-  
+  ![Made with VHS](https://vhs.charm.sh/vhs-6rltGALyCvZRi8BpLoMcFP.gif)  
 **WhatPlaneIsThat** is a terminal-based radar app you can SSH into. It shows a live radar-style display of planes flying near your location, using real aeronautic position data. The radar visualization is a fun and intuitive way to see what's overhead, where it's headed, and get a sense of the sky above you—all from your terminal.
 
 
