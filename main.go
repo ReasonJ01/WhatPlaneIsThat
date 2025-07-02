@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"math"
@@ -506,17 +507,17 @@ func newModel() *model {
 	}
 }
 
-const (
-	host = ""
-	port = "22"
-)
-
 func main() {
+	var host string
+	var port string
+	flag.StringVar(&host, "host", "", "Host to listen on (default: all interfaces)")
+	flag.StringVar(&port, "port", "22", "Port to listen on (default: 22)")
+	flag.Parse()
+
 	os.Setenv("TERM", "xterm-256color")
 	os.Setenv("COLORTERM", "truecolor")
 
 	s, err := wish.NewServer(
-
 		wish.WithAddress(net.JoinHostPort(host, port)),
 		wish.WithHostKeyPath("/var/lib/mysshapp/.ssh/termui_ed25519"),
 		wish.WithPublicKeyAuth(func(ctx ssh.Context, key ssh.PublicKey) bool {
