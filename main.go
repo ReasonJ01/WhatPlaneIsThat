@@ -23,10 +23,13 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/ssh"
 	"github.com/charmbracelet/wish"
+	"github.com/charmbracelet/wish/activeterm"
 	"github.com/charmbracelet/wish/bubbletea"
 	"github.com/charmbracelet/wish/logging"
+
 	"github.com/muesli/termenv"
 	"github.com/umahmood/haversine"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 var brightGreen = lipgloss.Color("#00ff00")
@@ -35,7 +38,6 @@ var dimGreen = lipgloss.Color("#007900")
 var dimmestGreen = lipgloss.Color("#001b00")
 
 var frameBg = lipgloss.NewStyle().Background(lipgloss.Color("#3b3a3a"))
-var emptyBg = lipgloss.NewStyle().Background(lipgloss.Color("#1b1c1c"))
 
 var baseStyle = lipgloss.NewStyle().
 	BorderStyle(lipgloss.NormalBorder()).
@@ -243,31 +245,6 @@ func doTick() tea.Cmd {
 	})
 }
 
-func inBounds(width int, height int, x int, y int) bool {
-	if x >= 0 && x < width && y >= 0 && y < height {
-		return true
-	}
-	return false
-}
-
-func getPlaneSymbol(p plane) rune {
-	heading := p.Heading
-
-	if heading >= 315 || heading < 45 {
-		return '^'
-	}
-	if heading >= 45 && heading < 135 {
-		return '>'
-	}
-	if heading >= 135 && heading < 225 {
-		return 'v'
-	}
-	if heading >= 225 && heading < 315 {
-		return '<'
-	}
-	return '*'
-}
-
 func withinSweep(bearing, sweepAngle, width, northOffset float64) bool {
 	bearing = math.Mod(bearing-northOffset, 2*math.Pi)
 	sweepAngle = math.Mod(sweepAngle, 2*math.Pi)
@@ -376,7 +353,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.lonInput.Blur()
 				return m, tea.Batch(cmds...)
 			case "esc":
-				// Cancel and close modal
 				m.showModal = false
 				m.modalFocused = false
 				m.latInput.Blur()
@@ -490,7 +466,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				table.WithWidth(tableWidth),
 			)
 
-			// Set default styles with basic customization
 			s := table.DefaultStyles()
 			s.Header = s.Header.
 				BorderStyle(lipgloss.NormalBorder()).
@@ -662,207 +637,6 @@ func (m *model) View() string {
 
 }
 
-func (m model) renderRadar(width, height int) string {
-	if width < 5 || height < 5 || len(m.buffer) < 5 || len(m.buffer[0]) < 5 {
-		return "Too small"
-	}
-
-	maxRx := float64(width/2) - 5
-	maxRy := float64(height)/(2.0*m.aspectRatio) - 5
-	maxR := min(maxRx, maxRy)
-	r := maxR
-
-	cx := width / 2
-	cy := height / 2
-
-	charsPerNM := float64(r) / float64(m.radarRange)
-
-	// Distance Labels
-	minLabelSpacingPx := 3.0
-	maxLabels := int(float64(r) / (minLabelSpacingPx * charsPerNM))
-	if maxLabels < 1 {
-		maxLabels = 1
-	}
-	niceSteps := []float64{1, 5, 10, 15, 20, 25, 50, 100, 200, 500}
-	labelStepNM := niceSteps[len(niceSteps)-1]
-	for _, step := range niceSteps {
-		if float64(m.radarRange)/step <= float64(maxLabels) {
-			labelStepNM = step
-			break
-		}
-	}
-
-	for y := range m.buffer {
-		for x := range m.buffer[y] {
-			c := &m.buffer[y][x]
-			if c.kind != "plane" {
-				c.char = ' '
-				c.kind = "blank"
-			}
-
-		}
-	}
-
-	// Distance Labels
-	for d := labelStepNM; d < float64(m.radarRange); d += labelStepNM {
-		radius := d * charsPerNM
-		x := cx + int(radius*math.Sin(0))
-		y := cy - int(radius*math.Cos(0)*m.aspectRatio)
-
-		label := strconv.Itoa(int(d))
-		for i, r := range []rune(label) {
-			if inBounds(width, height, x+i, y) {
-				c := &m.buffer[y][x+i]
-				c.kind = "label"
-				c.char = r
-			}
-		}
-	}
-
-	// Sweep Arm
-	prevAngle := m.sweepAngle - 0.15
-	for l := 0; l <= int(r); l++ {
-		for interp := 0.0; interp <= 1.0; interp += 0.1 {
-			theta := prevAngle + interp*(m.sweepAngle-prevAngle)
-			x := cx + int(float64(l)*math.Sin(theta))
-			y := cy - int(float64(l)*math.Cos(theta)*m.aspectRatio)
-
-			if inBounds(width, height, x, y) {
-				c := &m.buffer[y][x]
-				c.kind = "sweep"
-				c.sweepAge = int(interp * 10)
-				c.char = ' '
-			}
-		}
-	}
-
-	for phi := 0.0; phi < 2*math.Pi; phi += 0.001 {
-		x := cx + int(r*math.Sin(phi))
-		y := cy - int(r*math.Cos(phi)*m.aspectRatio)
-		if inBounds(width, height, x, y) {
-			c := &m.buffer[y][x]
-			c.char = ' '
-			c.kind = "ring"
-		}
-	}
-
-	for _, p := range m.planes {
-		if _, ok := m.visiblePlanes[p.FlightCode]; ok {
-			if p.DistanceFromObserver > float64(m.radarRange) {
-				continue
-			}
-
-			scale := float64(maxR-4) / float64(m.radarRange)
-			virtualDistance := p.DistanceFromObserver * scale
-
-			displayBearing := p.BearingFromObserver - m.northOffset
-			posX := cx + int(virtualDistance*math.Sin(displayBearing))
-			posY := cy - int(virtualDistance*math.Cos(displayBearing)*m.aspectRatio)
-
-			dx := float64(posX - cx)
-			dy := float64(posY - cy)
-
-			if inBounds(width, height, posX, posY) && math.Sqrt(dx*dx+dy*dy) < r {
-				c := &m.buffer[posY][posX]
-				c.kind = "plane"
-				c.char = getPlaneSymbol(p)
-
-				c.sweepAge = 0
-			}
-		}
-	}
-
-	for phi := 0.0; phi < 2*math.Pi; phi += 0.001 {
-		x := cx + int(r*math.Sin(phi))
-		y := cy - int(r*math.Cos(phi)*m.aspectRatio)
-		if inBounds(width, height, x, y) {
-			c := &m.buffer[y][x]
-			c.char = ' '
-			c.kind = "ring"
-		}
-	}
-
-	tickMarks := []float64{0, 90, 180, 270}
-	tickLabels := [][]rune{
-		{'0'},
-		{'9', '0'},
-		{'1', '8', '0'},
-		{'2', '7', '0'},
-	}
-	for i, tick := range tickMarks {
-		phi := tick * math.Pi / 180
-		phi -= m.northOffset
-
-		x := cx + int((r+3)*math.Sin(phi))
-		y := cy - int((r+3)*math.Cos(phi)*m.aspectRatio)
-		for j, r := range tickLabels[i] {
-			if inBounds(width, height, x+j, y) {
-				c := &m.buffer[y][x+j]
-				c.char = r
-				c.kind = "label"
-			}
-		}
-	}
-
-	var b strings.Builder
-	for _, row := range m.buffer {
-
-		for _, c := range row {
-			if c.kind == "ring" {
-				b.WriteString(frameBg.Render(" "))
-				continue
-
-			}
-			style := lipgloss.NewStyle()
-
-			switch {
-			case c.sweepAge <= 2:
-				style = style.Background(brightGreen)
-
-			case c.sweepAge > 2 && c.sweepAge <= 7:
-				style = style.Background(mediumGreen)
-
-			case c.sweepAge > 3 && c.sweepAge <= 12:
-				style = style.Background(dimGreen)
-
-			}
-
-			if c.kind == "plane" {
-
-				switch {
-				case c.sweepAge <= 15:
-					style = style.Foreground(brightGreen)
-
-				case c.sweepAge > 15 && c.sweepAge <= 30:
-					style = style.Foreground(mediumGreen)
-
-				case c.sweepAge > 30 && c.sweepAge <= 60:
-					style = style.Foreground(dimGreen)
-
-				case c.sweepAge > 60 && c.sweepAge <= 90:
-					style = style.Foreground(dimmestGreen)
-
-				case c.sweepAge == 99:
-					c.kind = "blank"
-					c.char = ' '
-
-				default:
-					style = style.Foreground(dimGreen)
-				}
-				b.WriteString(style.Render(string(c.char)))
-				continue
-			}
-
-			b.WriteString(style.Render(string(c.char)))
-
-		}
-
-		b.WriteByte('\n')
-	}
-
-	return b.String()
-}
-
 func newModel() *model {
 	latInput := textinput.New()
 	latInput.Placeholder = "40.7128"
@@ -891,17 +665,27 @@ func newModel() *model {
 }
 
 const (
-	host = "100.113.72.80"
-	port = "23234"
+	host = ""
+	port = "22"
 )
 
 func main() {
+	os.Setenv("TERM", "xterm-256color")
+	os.Setenv("COLORTERM", "truecolor")
 
 	s, err := wish.NewServer(
+
 		wish.WithAddress(net.JoinHostPort(host, port)),
-		wish.WithHostKeyPath(".ssh/termui_ed25519"),
+		wish.WithHostKeyPath("/var/lib/mysshapp/.ssh/termui_ed25519"),
+		wish.WithPublicKeyAuth(func(ctx ssh.Context, key ssh.PublicKey) bool {
+			return true
+		}),
+		wish.WithKeyboardInteractiveAuth(func(ctx ssh.Context, challenger gossh.KeyboardInteractiveChallenge) bool {
+			return true
+		}),
 		wish.WithMiddleware(
 			radarBubbleteaMiddleware(),
+			activeterm.Middleware(),
 			logging.Middleware(),
 		),
 	)
@@ -937,11 +721,18 @@ func radarBubbleteaMiddleware() wish.Middleware {
 			log.Printf("no active terminal, skipping")
 			return nil
 		}
+
 		m := newModel()
 		m.width = pty.Window.Width
 		m.height = pty.Window.Height
 
-		return tea.NewProgram(m, append(bubbletea.MakeOptions(s), tea.WithAltScreen())...)
+		p := tea.NewProgram(
+			m,
+			tea.WithAltScreen(),
+			tea.WithInput(s),
+			tea.WithOutput(s),
+		)
+		return p
 	}
-	return bubbletea.MiddlewareWithProgramHandler(teaHandler, termenv.ANSI256)
+	return bubbletea.MiddlewareWithProgramHandler(teaHandler, termenv.TrueColor)
 }
