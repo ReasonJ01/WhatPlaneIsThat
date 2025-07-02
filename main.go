@@ -152,6 +152,212 @@ func (m *model) UpdatePlaneRow(p plane) tea.Cmd {
 	return nil
 }
 
+func (m *model) handleModalInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "tab":
+		// Switch focus between inputs
+		if m.latInput.Focused() {
+			m.latInput.Blur()
+			m.lonInput.Focus()
+		} else {
+			m.lonInput.Blur()
+			m.latInput.Focus()
+		}
+		return m, nil
+	case "enter":
+		// Apply the new coordinates
+		if latStr := m.latInput.Value(); latStr != "" {
+			if lat, err := strconv.ParseFloat(latStr, 64); err == nil {
+				m.lat = lat
+			}
+		}
+		if lonStr := m.lonInput.Value(); lonStr != "" {
+			if lon, err := strconv.ParseFloat(lonStr, 64); err == nil {
+				m.lon = lon
+			}
+		}
+		m.showModal = false
+		m.modalFocused = false
+		m.latInput.Blur()
+		m.lonInput.Blur()
+		return m, nil
+	case "esc":
+		// Cancel and close modal
+		m.showModal = false
+		m.modalFocused = false
+		m.latInput.Blur()
+		m.lonInput.Blur()
+		// Reset inputs to current values
+		m.latInput.SetValue(fmt.Sprintf("%.4f", m.lat))
+		m.lonInput.SetValue(fmt.Sprintf("%.4f", m.lon))
+		return m, nil
+	}
+
+	// Update the focused input
+	var cmd tea.Cmd
+	if m.latInput.Focused() {
+		m.latInput, cmd = m.latInput.Update(msg)
+	} else if m.lonInput.Focused() {
+		m.lonInput, cmd = m.lonInput.Update(msg)
+	}
+	return m, cmd
+}
+
+func (m *model) handleKeyInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "]":
+		m.northOffset += 0.1
+		return m, nil
+	case "[":
+		m.northOffset -= 0.1
+		return m, nil
+	case "=":
+		if m.radarRange < MAX_RADAR_RANGE {
+			if m.radarRange == 1 {
+				m.radarRange = 5
+			} else {
+				m.radarRange += 5
+			}
+		}
+		return m, nil
+	case "-":
+		if m.radarRange > MIN_RADAR_RANGE {
+			if m.radarRange == 5 {
+				m.radarRange = 1
+			} else {
+				m.radarRange -= 5
+			}
+		}
+		return m, nil
+	case "m":
+		m.showModal = !m.showModal
+		if m.showModal {
+			m.modalFocused = true
+			m.latInput.Focus()
+			m.latInput.SetValue(fmt.Sprintf("%.4f", m.lat))
+			m.lonInput.SetValue(fmt.Sprintf("%.4f", m.lon))
+		} else {
+			m.modalFocused = false
+			m.latInput.Blur()
+			m.lonInput.Blur()
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m *model) handleWindowResize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
+	m.width = msg.Width
+	m.height = msg.Height
+
+	m.buffer = make([][]cell, m.height)
+	for y := range m.buffer {
+		m.buffer[y] = make([]cell, m.width/2)
+		for x := range m.buffer[y] {
+			m.buffer[y][x] = cell{' ', "blank", int(100)}
+		}
+	}
+
+	if !m.tableLoaded {
+		columns := []table.Column{
+			{Title: "FLT", Width: 8},
+			{Title: "AIRLINE", Width: 16},
+			{Title: "ORIGIN", Width: 18},
+			{Title: "DEST", Width: 18},
+			{Title: "DIST(NM)", Width: 10},
+		}
+		rows := []table.Row{}
+
+		tableHeight := m.height / 2
+		if tableHeight < 5 {
+			tableHeight = 5
+		}
+
+		tableWidth := 0
+		for _, column := range columns {
+			tableWidth += column.Width
+		}
+		tableWidth += 10
+
+		m.tbl = table.New(
+			table.WithColumns(columns),
+			table.WithRows(rows),
+			table.WithFocused(true),
+			table.WithHeight(tableHeight),
+			table.WithWidth(tableWidth),
+		)
+
+		// Set default styles with basic customization
+		s := table.DefaultStyles()
+		s.Header = s.Header.
+			BorderStyle(lipgloss.NormalBorder()).
+			BorderForeground(lipgloss.Color("240")).
+			BorderBottom(true).
+			Bold(false)
+		s.Selected = s.Selected.
+			Foreground(lipgloss.Color("black")).
+			Background(mediumGreen).
+			Bold(false)
+		m.tbl.SetStyles(s)
+
+		m.tableLoaded = true
+	}
+	if !m.initialPlanesLoaded {
+		m.planes = m.GetPlanes()
+		m.initialPlanesLoaded = true
+	}
+	return m, nil
+}
+
+func (m *model) handleTickMsg() (tea.Model, tea.Cmd) {
+	m.sweepAngle += 0.1
+	if m.sweepAngle >= 2*math.Pi {
+		m.sweepAngle = 0
+		m.planes = m.GetPlanes()
+	}
+
+	for y := range m.buffer {
+		for x := range m.buffer[y] {
+			c := &m.buffer[y][x]
+			if c.sweepAge < 100 {
+				c.sweepAge = c.sweepAge + 1
+			}
+		}
+	}
+	currentVisible := make(map[string]bool)
+	currentInSweep := make(map[string]bool)
+	for _, p := range m.planes {
+		// Track all planes within range, regardless of sweep position
+		if p.DistanceFromObserver <= float64(m.radarRange) {
+			currentVisible[p.FlightCode] = true
+
+			// Track planes currently in sweep
+			if withinSweep(p.BearingFromObserver, m.sweepAngle, 0.5, m.northOffset) {
+				currentInSweep[p.FlightCode] = true
+				if !m.visiblePlanes[p.FlightCode] {
+					m.UpdatePlaneRow(p)
+				}
+			}
+		}
+	}
+
+	// Remove planes from table that are no longer visible
+	rows := m.tbl.Rows()
+	var newRows []table.Row
+	for _, row := range rows {
+		flightCode := row[0]
+		if currentVisible[flightCode] {
+			newRows = append(newRows, row)
+		}
+	}
+	m.tbl.SetRows(newRows)
+
+	m.visiblePlanes = currentInSweep
+	return m, doTick()
+}
+
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	var cmds []tea.Cmd
@@ -162,218 +368,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		// Handle text input updates when modal is focused
 		if m.showModal && m.modalFocused {
-			switch msg.String() {
-			case "tab":
-				// Switch focus between inputs
-				if m.latInput.Focused() {
-					m.latInput.Blur()
-					m.lonInput.Focus()
-				} else {
-					m.lonInput.Blur()
-					m.latInput.Focus()
-				}
-				return m, tea.Batch(cmds...)
-			case "enter":
-				// Apply the new coordinates
-				if latStr := m.latInput.Value(); latStr != "" {
-					if lat, err := strconv.ParseFloat(latStr, 64); err == nil {
-						m.lat = lat
-					}
-				}
-				if lonStr := m.lonInput.Value(); lonStr != "" {
-					if lon, err := strconv.ParseFloat(lonStr, 64); err == nil {
-						m.lon = lon
-					}
-				}
-				m.showModal = false
-				m.modalFocused = false
-				m.latInput.Blur()
-				m.lonInput.Blur()
-				return m, tea.Batch(cmds...)
-			case "esc":
-				m.showModal = false
-				m.modalFocused = false
-				m.latInput.Blur()
-				m.lonInput.Blur()
-				// Reset inputs to current values
-				m.latInput.SetValue(fmt.Sprintf("%.4f", m.lat))
-				m.lonInput.SetValue(fmt.Sprintf("%.4f", m.lon))
-				return m, tea.Batch(cmds...)
-			}
-
-			// Update the focused input
-			if m.latInput.Focused() {
-				m.latInput, cmd = m.latInput.Update(msg)
-				cmds = append(cmds, cmd)
-			} else if m.lonInput.Focused() {
-				m.lonInput, cmd = m.lonInput.Update(msg)
-				cmds = append(cmds, cmd)
-			}
-
-			return m, tea.Batch(cmds...)
+			return m.handleModalInput(msg)
 		}
-
-		// Handle regular key messages when modal is not focused
-		switch msg.String() {
-		case "ctrl+c":
-			return m, tea.Quit
-
-		case "]":
-			m.northOffset += 0.1
-			return m, tea.Batch(cmds...)
-
-		case "[":
-			m.northOffset -= 0.1
-			return m, tea.Batch(cmds...)
-
-		case "=":
-			if m.radarRange < MAX_RADAR_RANGE {
-				if m.radarRange == 1 {
-					m.radarRange = 5
-				} else {
-					m.radarRange += 5
-				}
-
-			}
-			return m, tea.Batch(cmds...)
-
-		case "-":
-			if m.radarRange > MIN_RADAR_RANGE {
-				if m.radarRange == 5 {
-					m.radarRange = 1
-				} else {
-					m.radarRange -= 5
-				}
-			}
-			return m, tea.Batch(cmds...)
-
-		case "m":
-			m.showModal = !m.showModal
-			if m.showModal {
-				m.modalFocused = true
-				m.latInput.Focus()
-				m.latInput.SetValue(fmt.Sprintf("%.4f", m.lat))
-				m.lonInput.SetValue(fmt.Sprintf("%.4f", m.lon))
-			} else {
-				m.modalFocused = false
-				m.latInput.Blur()
-				m.lonInput.Blur()
-			}
-			return m, tea.Batch(cmds...)
-		}
-		return m, tea.Batch(cmds...)
-
+		return m.handleKeyInput(msg)
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-
-		m.buffer = make([][]cell, m.height)
-		for y := range m.buffer {
-			m.buffer[y] = make([]cell, m.width/2)
-			for x := range m.buffer[y] {
-				m.buffer[y][x] = cell{' ', "blank", int(100)}
-			}
-		}
-
-		if !m.tableLoaded {
-			columns := []table.Column{
-				{Title: "FLT", Width: 8},
-				{Title: "AIRLINE", Width: 16},
-				{Title: "ORIGIN", Width: 18},
-				{Title: "DEST", Width: 18},
-				{Title: "DIST(NM)", Width: 10},
-			}
-			rows := []table.Row{}
-
-			tableHeight := m.height / 2
-			if tableHeight < 5 {
-				tableHeight = 5
-			}
-
-			tableWidth := 0
-			for _, column := range columns {
-				tableWidth += column.Width
-			}
-			tableWidth += 10
-
-			m.tbl = table.New(
-				table.WithColumns(columns),
-				table.WithRows(rows),
-				table.WithFocused(true),
-				table.WithHeight(tableHeight),
-				table.WithWidth(tableWidth),
-			)
-
-			s := table.DefaultStyles()
-			s.Header = s.Header.
-				BorderStyle(lipgloss.NormalBorder()).
-				BorderForeground(lipgloss.Color("240")).
-				BorderBottom(true).
-				Bold(false)
-			s.Selected = s.Selected.
-				Foreground(lipgloss.Color("black")).
-				Background(mediumGreen).
-				Bold(false)
-			m.tbl.SetStyles(s)
-
-			m.tableLoaded = true
-		}
-		if !m.initialPlanesLoaded {
-			m.planes = m.GetPlanes()
-			m.initialPlanesLoaded = true
-		}
-		return m, tea.Batch(cmds...)
-
+		return m.handleWindowResize(msg)
 	case tickMsg:
-		m.sweepAngle += 0.1
-		if m.sweepAngle >= 2*math.Pi {
-			m.sweepAngle = 0
-			m.planes = m.GetPlanes()
-		}
-
-		for y := range m.buffer {
-			for x := range m.buffer[y] {
-				c := &m.buffer[y][x]
-				if c.sweepAge < 100 {
-					c.sweepAge = c.sweepAge + 1
-				}
-			}
-		}
-		currentVisible := make(map[string]bool)
-		currentInSweep := make(map[string]bool)
-		for _, p := range m.planes {
-			// Track all planes within range, regardless of sweep position
-			if p.DistanceFromObserver <= float64(m.radarRange) {
-				currentVisible[p.FlightCode] = true
-
-				// Track planes currently in sweep
-				if withinSweep(p.BearingFromObserver, m.sweepAngle, 0.5, m.northOffset) {
-					currentInSweep[p.FlightCode] = true
-					if !m.visiblePlanes[p.FlightCode] {
-						m.UpdatePlaneRow(p)
-						cmds = append(cmds, tea.Printf(""))
-					}
-				}
-			}
-		}
-
-		// Remove planes from table that are no longer visible
-		rows := m.tbl.Rows()
-		var newRows []table.Row
-		for _, row := range rows {
-			flightCode := row[0]
-			if currentVisible[flightCode] {
-				newRows = append(newRows, row)
-			}
-		}
-		m.tbl.SetRows(newRows)
-
-		m.visiblePlanes = currentInSweep
-		cmds = append(cmds, doTick())
-
-		return m, tea.Batch(cmds...)
+		return m.handleTickMsg()
 	}
 
 	return m, tea.Batch(cmds...)
