@@ -532,15 +532,15 @@ func main() {
 		),
 	)
 	if err != nil {
-		log.Printf("Could not start server", "error", err)
+		log.Print("Could not start server", "error", err)
 	}
 
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
-	log.Printf("Starting SSH server", "host", host, "port", port)
+	log.Print("Starting SSH server", "host", host, "port", port)
 	go func() {
 		if err = s.ListenAndServe(); err != nil && !errors.Is(err, ssh.ErrServerClosed) {
-			log.Printf("Could not start server", "error", err)
+			log.Print("Could not start server", "error", err)
 			done <- nil
 		}
 	}()
@@ -550,17 +550,17 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer func() { cancel() }()
 	if err := s.Shutdown(ctx); err != nil && !errors.Is(err, ssh.ErrServerClosed) {
-		log.Printf("Could not stop server", "error", err)
+		log.Print("Could not stop server", "error", err)
 	}
 }
 
 func radarBubbleteaMiddleware() wish.Middleware {
 	teaHandler := func(s ssh.Session) *tea.Program {
-		log.Printf("New SSH session started")
+		log.Print("New SSH session started")
 
 		pty, _, active := s.Pty()
 		if !active {
-			log.Printf("no active terminal, skipping")
+			log.Print("no active terminal, skipping")
 			return nil
 		}
 
